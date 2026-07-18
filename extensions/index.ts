@@ -9,7 +9,13 @@ import { promisify } from "node:util";
 const exec = promisify(execCallback);
 
 const DEFAULT_BASE_URL = "http://127.0.0.1:3456";
-const DEFAULT_PORT = Number(new URL(DEFAULT_BASE_URL).port) || 3456;
+const DEFAULT_PORT = (() => {
+	try {
+		return Number(new URL(DEFAULT_BASE_URL).port) || 3456;
+	} catch {
+		return 3456;
+	}
+})();
 const HEALTH_TIMEOUT_MS = 3000;
 const STARTUP_WAIT_MS = 6000;
 const STARTUP_POLL_MS = 500;
@@ -20,106 +26,198 @@ const SONNET_MAX_TOKENS = 64000;
 const OPUS_MAX_TOKENS = 32768;
 const HAIKU_MAX_TOKENS = 16384;
 const FABLE_MAX_TOKENS = 128000;
-const SONNET_5_COST = { input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 } as const;
-const FABLE_COST = { input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5 } as const;
-const SONNET_COST = { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 } as const;
-const OPUS_COST = { input: 15, output: 75, cacheRead: 1.5, cacheWrite: 18.75 } as const;
-const HAIKU_COST = { input: 0.8, output: 4, cacheRead: 0.08, cacheWrite: 1 } as const;
-const LOCAL_MERIDIAN_BIN = fileURLToPath(new URL("../../.bin/meridian", import.meta.url));
+// Cost table and per-family metadata. Used both by the static fallback catalog
+// and to fill in fields the Meridian /v1/models endpoint does not expose (max
+// output tokens and pricing).
+type CostTable = {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+};
+const SONNET_5_COST: CostTable = {
+	input: 2,
+	output: 10,
+	cacheRead: 0.2,
+	cacheWrite: 2.5,
+};
+const FABLE_COST: CostTable = {
+	input: 10,
+	output: 50,
+	cacheRead: 1,
+	cacheWrite: 12.5,
+};
+const SONNET_COST: CostTable = {
+	input: 3,
+	output: 15,
+	cacheRead: 0.3,
+	cacheWrite: 3.75,
+};
+const OPUS_COST: CostTable = {
+	input: 15,
+	output: 75,
+	cacheRead: 1.5,
+	cacheWrite: 18.75,
+};
+const HAIKU_COST: CostTable = {
+	input: 0.8,
+	output: 4,
+	cacheRead: 0.08,
+	cacheWrite: 1,
+};
+// Discovery bounds and defaults for fields /v1/models omits.
+const MODEL_DISCOVERY_TIMEOUT_MS = 3000;
+const DEFAULT_MAX_TOKENS = 32000;
+const DEFAULT_COST: CostTable = {
+	input: 0,
+	output: 0,
+	cacheRead: 0,
+	cacheWrite: 0,
+};
+// Family lookup keyed on the second id segment ("claude-fable-5" -> "fable").
+// Exact-id cost overrides take precedence over family defaults (e.g. Sonnet 5's
+// promotional rate differs from the Sonnet family default).
+const FAMILY_MAX_TOKENS: Record<string, number> = {
+	fable: FABLE_MAX_TOKENS,
+	sonnet: SONNET_MAX_TOKENS,
+	opus: OPUS_MAX_TOKENS,
+	haiku: HAIKU_MAX_TOKENS,
+};
+const FAMILY_COST: Record<string, CostTable> = {
+	fable: FABLE_COST,
+	sonnet: SONNET_COST,
+	opus: OPUS_COST,
+	haiku: HAIKU_COST,
+};
+const ID_COST_OVERRIDES: Record<string, CostTable> = {
+	"claude-sonnet-5": SONNET_5_COST, // promotional rate through 2026-08-31
+};
+// Shape of a Meridian /v1/models entry (only the fields we consume).
+interface MeridianModelCapability {
+	supported?: boolean;
+}
+interface MeridianModelEntry {
+	id: string;
+	display_name?: string;
+	context_window?: number;
+	capabilities?: {
+		thinking?: MeridianModelCapability & {
+			types?: {
+				adaptive?: MeridianModelCapability;
+				enabled?: MeridianModelCapability;
+			};
+		};
+		effort?: Record<string, MeridianModelCapability>;
+		image_input?: MeridianModelCapability;
+		pdf_input?: MeridianModelCapability;
+	};
+}
+// Shape we hand to pi.registerProvider.
+interface MeridianModelConfig {
+	id: string;
+	name: string;
+	reasoning: boolean;
+	input: ("text" | "image")[];
+	cost: CostTable;
+	contextWindow: number;
+	maxTokens: number;
+}
+const LOCAL_MERIDIAN_BIN = fileURLToPath(
+	new URL("../../.bin/meridian", import.meta.url),
+);
 
 function getMeridianBin(): string {
-  return process.env.MERIDIAN_BIN?.trim() || LOCAL_MERIDIAN_BIN || "meridian";
+	return process.env.MERIDIAN_BIN?.trim() || LOCAL_MERIDIAN_BIN || "meridian";
 }
 
 function getBaseUrl(): string {
-  return process.env.MERIDIAN_BASE_URL || DEFAULT_BASE_URL;
+	return process.env.MERIDIAN_BASE_URL || DEFAULT_BASE_URL;
 }
 
 function getApiKey(): string {
-  return process.env.MERIDIAN_API_KEY?.trim() || "meridian";
+	return process.env.MERIDIAN_API_KEY?.trim() || "meridian";
 }
 
 function getProviderHeaders(): Record<string, string> {
-  const headers: Record<string, string> = {
-    "x-meridian-agent": "pi",
-  };
-  const profile = process.env.MERIDIAN_PROFILE?.trim();
-  if (profile) {
-    headers["x-meridian-profile"] = profile;
-  }
-  return headers;
+	const headers: Record<string, string> = {
+		"x-meridian-agent": "pi",
+	};
+	const profile = process.env.MERIDIAN_PROFILE?.trim();
+	if (profile) {
+		headers["x-meridian-profile"] = profile;
+	}
+	return headers;
 }
 
 function getMeridianRequestHeaders(): Record<string, string> {
-  return {
-    ...getProviderHeaders(),
-    Authorization: `Bearer ${getApiKey()}`,
-  };
+	return {
+		...getProviderHeaders(),
+		Authorization: `Bearer ${getApiKey()}`,
+	};
 }
 
 function getPortFromBaseUrl(baseUrl: string): number {
-  try {
-    return Number(new URL(baseUrl).port) || DEFAULT_PORT;
-  } catch {
-    return DEFAULT_PORT;
-  }
+	try {
+		return Number(new URL(baseUrl).port) || DEFAULT_PORT;
+	} catch {
+		return DEFAULT_PORT;
+	}
 }
 
 function normalizeCwd(cwd: string): string {
-  const normalized = cwd.trim().replace(/\\/g, "/");
-  return normalized || ".";
+	const normalized = cwd.trim().replace(/\\/g, "/");
+	return normalized || ".";
 }
 
 const MERIDIAN_BASE_PROMPT = [
-  "You are Claude Code operating through Meridian for pi, a terminal coding assistant. Help the user by analyzing code, proposing changes, and using the available tools when needed.",
-  "",
-  "Guidelines:",
-  "- Be concise in your responses",
-  "- Show file paths clearly when working with files",
-  "- Prefer using the available tools over guessing",
-  "- Follow project-specific instructions when present",
+	"You are Claude Code operating through Meridian for pi, a terminal coding assistant. Help the user by analyzing code, proposing changes, and using the available tools when needed.",
+	"",
+	"Guidelines:",
+	"- Be concise in your responses",
+	"- Show file paths clearly when working with files",
+	"- Prefer using the available tools over guessing",
+	"- Follow project-specific instructions when present",
 ].join("\n");
 
 const PROJECT_CONTEXT_END_REGEX =
-  /\n(?:<available_skills>|Current date:|Current working directory:)/;
+	/\n(?:<available_skills>|Current date:|Current working directory:)/;
 const CURRENT_DATE_LINE_REGEX = /^Current date:.*$/m;
-const CURRENT_WORKING_DIRECTORY_LINE_REGEX =
-  /^Current working directory:.*$/m;
+const CURRENT_WORKING_DIRECTORY_LINE_REGEX = /^Current working directory:.*$/m;
 
 function extractProjectContextSection(systemPrompt: string): string {
-  const projectContextHeader = "# Project Context";
-  const startIndex = systemPrompt.indexOf(projectContextHeader);
-  if (startIndex === -1) return "";
+	const projectContextHeader = "# Project Context";
+	const startIndex = systemPrompt.indexOf(projectContextHeader);
+	if (startIndex === -1) return "";
 
-  const remaining = systemPrompt.slice(startIndex);
-  const endMatch = PROJECT_CONTEXT_END_REGEX.exec(remaining);
-  const endIndex = endMatch ? endMatch.index : remaining.length;
+	const remaining = systemPrompt.slice(startIndex);
+	const endMatch = PROJECT_CONTEXT_END_REGEX.exec(remaining);
+	const endIndex = endMatch ? endMatch.index : remaining.length;
 
-  return remaining.slice(0, endIndex).trim();
+	return remaining.slice(0, endIndex).trim();
 }
 
 function buildMeridianSafeSystemPrompt(
-  originalSystemPrompt: string,
-  cwd: string
+	originalSystemPrompt: string,
+	cwd: string,
 ): string {
-  const projectContext = extractProjectContextSection(originalSystemPrompt);
+	const projectContext = extractProjectContextSection(originalSystemPrompt);
 
-  const currentDateLine =
-    originalSystemPrompt.match(CURRENT_DATE_LINE_REGEX)?.[0] ||
-    `Current date: ${new Date().toISOString().slice(0, 10)}`;
+	const currentDateLine =
+		originalSystemPrompt.match(CURRENT_DATE_LINE_REGEX)?.[0] ||
+		`Current date: ${new Date().toISOString().slice(0, 10)}`;
 
-  const currentWorkingDirectoryLine =
-    originalSystemPrompt.match(CURRENT_WORKING_DIRECTORY_LINE_REGEX)?.[0] ||
-    `Current working directory: ${normalizeCwd(cwd)}`;
+	const currentWorkingDirectoryLine =
+		originalSystemPrompt.match(CURRENT_WORKING_DIRECTORY_LINE_REGEX)?.[0] ||
+		`Current working directory: ${normalizeCwd(cwd)}`;
 
-  return [
-    MERIDIAN_BASE_PROMPT,
-    projectContext,
-    currentDateLine,
-    currentWorkingDirectoryLine,
-  ]
-    .filter(Boolean)
-    .join("\n\n");
+	return [
+		MERIDIAN_BASE_PROMPT,
+		projectContext,
+		currentDateLine,
+		currentWorkingDirectoryLine,
+	]
+		.filter(Boolean)
+		.join("\n\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -127,71 +225,74 @@ function buildMeridianSafeSystemPrompt(
 // ---------------------------------------------------------------------------
 
 interface MeridianHealth {
-  status: string;
-  version?: string;
-  auth?: {
-    loggedIn: boolean;
-    email?: string;
-    subscriptionType?: string;
-  };
-  mode?: string;
-  error?: string;
+	status: string;
+	version?: string;
+	auth?: {
+		loggedIn: boolean;
+		email?: string;
+		subscriptionType?: string;
+	};
+	mode?: string;
+	error?: string;
 }
 
 async function fetchHealth(
-  baseUrl: string,
-  signal?: AbortSignal,
-  headers = getMeridianRequestHeaders()
+	baseUrl: string,
+	signal?: AbortSignal,
+	headers = getMeridianRequestHeaders(),
 ): Promise<MeridianHealth> {
-  if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+	if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
 
-  const controller = new AbortController();
-  let timedOut = false;
-  const timeout = setTimeout(() => {
-    timedOut = true;
-    controller.abort();
-  }, HEALTH_TIMEOUT_MS);
+	const controller = new AbortController();
+	let timedOut = false;
+	const timeout = setTimeout(() => {
+		timedOut = true;
+		controller.abort();
+	}, HEALTH_TIMEOUT_MS);
 
-  const onExternalAbort = () => controller.abort();
-  if (signal) {
-    signal.addEventListener("abort", onExternalAbort, { once: true });
-  }
+	const onExternalAbort = () => controller.abort();
+	if (signal) {
+		signal.addEventListener("abort", onExternalAbort, { once: true });
+	}
 
-  try {
-    const response = await fetch(`${baseUrl}/health`, {
-      headers,
-      signal: controller.signal,
-    });
-    const body = await response.text();
-    let health: MeridianHealth;
-    try {
-      const parsed: unknown = JSON.parse(body);
-      health = isValidHealth(parsed)
-        ? parsed
-        : { status: "error", error: `Unexpected response: ${body.slice(0, 200)}` };
-    } catch {
-      health = {
-        status: "error",
-        error: `HTTP ${response.status}: ${body.slice(0, 200)}`,
-      };
-    }
-    if (!response.ok && !health.error) {
-      health.error = `HTTP ${response.status}`;
-    }
-    return health;
-  } catch (err) {
-    if (timedOut) {
-      throw new Error(
-        `Meridian health check timed out after ${HEALTH_TIMEOUT_MS}ms`
-      );
-    }
-    throw err;
-  } finally {
-    clearTimeout(timeout);
-    if (signal) {
-      signal.removeEventListener("abort", onExternalAbort);
-    }
-  }
+	try {
+		const response = await fetch(`${baseUrl}/health`, {
+			headers,
+			signal: controller.signal,
+		});
+		const body = await response.text();
+		let health: MeridianHealth;
+		try {
+			const parsed: unknown = JSON.parse(body);
+			health = isValidHealth(parsed)
+				? parsed
+				: {
+						status: "error",
+						error: `Unexpected response: ${body.slice(0, 200)}`,
+					};
+		} catch {
+			health = {
+				status: "error",
+				error: `HTTP ${response.status}: ${body.slice(0, 200)}`,
+			};
+		}
+		if (!response.ok && !health.error) {
+			health.error = `HTTP ${response.status}`;
+		}
+		return health;
+	} catch (err) {
+		if (timedOut) {
+			throw new Error(
+				`Meridian health check timed out after ${HEALTH_TIMEOUT_MS}ms`,
+			);
+		}
+		throw err;
+	} finally {
+		clearTimeout(timeout);
+		if (signal) {
+			signal.removeEventListener("abort", onExternalAbort);
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -199,25 +300,29 @@ async function fetchHealth(
 // ---------------------------------------------------------------------------
 
 function isValidHealth(h: unknown): h is MeridianHealth {
-  return (
-    typeof h === "object" &&
-    h !== null &&
-    "status" in h &&
-    typeof (h as MeridianHealth).status === "string"
-  );
+	return (
+		typeof h === "object" &&
+		h !== null &&
+		"status" in h &&
+		typeof (h as MeridianHealth).status === "string"
+	);
 }
 
 async function isReachable(
-  baseUrl: string,
-  timeoutMs = HEALTH_TIMEOUT_MS,
-  headers = getMeridianRequestHeaders()
+	baseUrl: string,
+	timeoutMs = HEALTH_TIMEOUT_MS,
+	headers = getMeridianRequestHeaders(),
 ): Promise<{ ok: boolean; health?: MeridianHealth }> {
-  try {
-    const health = await fetchHealth(baseUrl, AbortSignal.timeout(timeoutMs), headers);
-    return { ok: true, health };
-  } catch {
-    return { ok: false };
-  }
+	try {
+		const health = await fetchHealth(
+			baseUrl,
+			AbortSignal.timeout(timeoutMs),
+			headers,
+		);
+		return { ok: true, health };
+	} catch {
+		return { ok: false };
+	}
 }
 
 let startInFlight: Promise<boolean> | null = null;
@@ -231,69 +336,78 @@ let versionChecked = false;
  * Dedupes concurrent calls and avoids rapid retry loops.
  */
 async function startMeridianDaemon(
-  baseUrl: string,
-  port: number,
-  headers = getMeridianRequestHeaders()
+	baseUrl: string,
+	port: number,
+	headers = getMeridianRequestHeaders(),
 ): Promise<boolean> {
-  // Dedupe: if a start is already in flight, wait on it
-  if (startInFlight) return startInFlight;
+	// Dedupe: if a start is already in flight, wait on it
+	if (startInFlight) return startInFlight;
 
-  // Cooldown: don't retry immediately after a failure
-  if (Date.now() - lastStartFailedAt < START_RETRY_COOLDOWN_MS) return false;
+	// Cooldown: don't retry immediately after a failure
+	if (Date.now() - lastStartFailedAt < START_RETRY_COOLDOWN_MS) return false;
 
-  startInFlight = (async () => {
-    let spawnError: string | null = null;
+	startInFlight = (async () => {
+		let spawnError: string | null = null;
 
-    try {
-      await new Promise<void>((resolveSpawn) => {
-        try {
-          const child = spawn(getMeridianBin(), ["--port", String(port)], {
-            detached: true,
-            stdio: "ignore",
-            env: process.env,
-          });
+		try {
+			await new Promise<void>((resolveSpawn) => {
+				try {
+					const child = spawn(getMeridianBin(), ["--port", String(port)], {
+						detached: true,
+						stdio: "ignore",
+						env: process.env,
+					});
 
-          child.unref();
+					child.unref();
 
-          child.on("error", (err: NodeJS.ErrnoException) => {
-            spawnError = err.code === "ENOENT"
-              ? "meridian not found on PATH. Install: npm install -g @rynfar/meridian"
-              : `Failed to start: ${err.message}`;
-            resolveSpawn();
-          });
+					child.on("error", (err: NodeJS.ErrnoException) => {
+						spawnError =
+							err.code === "ENOENT"
+								? "meridian not found on PATH. Install: npm install -g @rynfar/meridian"
+								: `Failed to start: ${err.message}`;
+						resolveSpawn();
+					});
 
-          // Resolve once the process has launched (or errored)
-          // The daemon takes a moment to bind the port
-          setTimeout(resolveSpawn, 200);
-        } catch (err) {
-          spawnError = `Failed to start: ${err instanceof Error ? err.message : String(err)}`;
-          resolveSpawn();
-        }
-      });
+					// Resolve once the process has launched (or errored)
+					// The daemon takes a moment to bind the port
+					setTimeout(resolveSpawn, 200);
+				} catch (err) {
+					spawnError = `Failed to start: ${err instanceof Error ? err.message : String(err)}`;
+					resolveSpawn();
+				}
+			});
 
-      if (spawnError) {
-        lastStartFailedAt = Date.now();
-        return false;
-      }
+			if (spawnError) {
+				lastStartFailedAt = Date.now();
+				return false;
+			}
 
-      // Poll until reachable or deadline, using bounded timeout per probe
-      const deadline = Date.now() + STARTUP_WAIT_MS;
-      while (Date.now() < deadline) {
-        const remaining = deadline - Date.now();
-        if ((await isReachable(baseUrl, Math.min(HEALTH_TIMEOUT_MS, remaining), headers)).ok) {
-          return true;
-        }
-        await new Promise((r) => setTimeout(r, STARTUP_POLL_MS));
-      }
+			// Poll until reachable or deadline, using bounded timeout per probe
+			const deadline = Date.now() + STARTUP_WAIT_MS;
+			while (Date.now() < deadline) {
+				const remaining = deadline - Date.now();
+				if (
+					(
+						await isReachable(
+							baseUrl,
+							Math.min(HEALTH_TIMEOUT_MS, remaining),
+							headers,
+						)
+					).ok
+				) {
+					return true;
+				}
+				await new Promise((r) => setTimeout(r, STARTUP_POLL_MS));
+			}
 
-      lastStartFailedAt = Date.now();
-      return false;
-    } finally {
-      startInFlight = null;
-    }
-  })();
+			lastStartFailedAt = Date.now();
+			return false;
+		} finally {
+			startInFlight = null;
+		}
+	})();
 
-  return startInFlight;
+	return startInFlight;
 }
 
 // ---------------------------------------------------------------------------
@@ -301,9 +415,9 @@ async function startMeridianDaemon(
 // ---------------------------------------------------------------------------
 
 interface VersionStatus {
-  installed: string | null;
-  latest: string | null;
-  updateAvailable: boolean;
+	installed: string | null;
+	latest: string | null;
+	updateAvailable: boolean;
 }
 
 /**
@@ -311,393 +425,510 @@ interface VersionStatus {
  * Returns negative if a < b, 0 if equal, positive if a > b.
  */
 function compareSemver(a: string, b: string): number {
-  const pa = a.replace(/^v/, "").split(".").map(Number);
-  const pb = b.replace(/^v/, "").split(".").map(Number);
-  for (let i = 0; i < 3; i++) {
-    const na = pa[i] || 0;
-    const nb = pb[i] || 0;
-    if (na !== nb) return na - nb;
-  }
-  return 0;
+	const pa = a.replace(/^v/, "").split(".").map(Number);
+	const pb = b.replace(/^v/, "").split(".").map(Number);
+	for (let i = 0; i < 3; i++) {
+		const na = pa[i] || 0;
+		const nb = pb[i] || 0;
+		if (na !== nb) return na - nb;
+	}
+	return 0;
 }
 
 async function getInstalledVersion(): Promise<string | null> {
-  try {
-    // Try the configured or bundled meridian executable first.
-    let binPath = getMeridianBin();
-    if (!binPath) {
-      const { stdout: whichOutput } = await exec("which meridian", { timeout: 3000 });
-      binPath = whichOutput.trim();
-    }
-    if (!binPath) return null;
+	try {
+		// Try the configured or bundled meridian executable first.
+		let binPath = getMeridianBin();
+		if (!binPath) {
+			const { stdout: whichOutput } = await exec("which meridian", {
+				timeout: 3000,
+			});
+			binPath = whichOutput.trim();
+		}
+		if (!binPath) return null;
 
-    // Resolve the real path (in case it's a symlink)
-    const resolved = realpathSync(binPath);
+		// Resolve the real path (in case it's a symlink)
+		const resolved = realpathSync(binPath);
 
-    // The package.json should be in a parent node_modules directory
-    // e.g. /opt/homebrew/lib/node_modules/@rynfar/meridian/package.json
-    // or next to the bin in a package directory
-    const possiblePaths = [
-      // Standard npm global layout: bin -> ../lib/node_modules/@rynfar/meridian/
-      join(resolved, "..", "..", "lib", "node_modules", "@rynfar", "meridian", "package.json"),
-      // Check the bin's directory for package.json
-      join(resolved, "..", "package.json"),
-      // Walk up from bin looking for node_modules/@rynfar/meridian
-    ];
+		// The package.json should be in a parent node_modules directory
+		// e.g. /opt/homebrew/lib/node_modules/@rynfar/meridian/package.json
+		// or next to the bin in a package directory
+		const possiblePaths = [
+			// Standard npm global layout: bin -> ../lib/node_modules/@rynfar/meridian/
+			join(
+				resolved,
+				"..",
+				"..",
+				"lib",
+				"node_modules",
+				"@rynfar",
+				"meridian",
+				"package.json",
+			),
+			// Check the bin's directory for package.json
+			join(resolved, "..", "package.json"),
+			// Walk up from bin looking for node_modules/@rynfar/meridian
+		];
 
-    for (const pkgPath of possiblePaths) {
-      try {
-        const content = await readFile(pkgPath, "utf8");
-        const pkg: unknown = JSON.parse(content);
-        if (
-          typeof pkg === "object" && pkg !== null &&
-          (pkg as Record<string, unknown>).name === "@rynfar/meridian" &&
-          typeof (pkg as Record<string, unknown>).version === "string"
-        ) {
-          return (pkg as Record<string, unknown>).version as string;
-        }
-      } catch {
-        // Try next candidate path
-      }
-    }
-  } catch {
-    // Fallback: can't determine
-  }
-  return null;
+		for (const pkgPath of possiblePaths) {
+			try {
+				const content = await readFile(pkgPath, "utf8");
+				const pkg: unknown = JSON.parse(content);
+				if (
+					typeof pkg === "object" &&
+					pkg !== null &&
+					(pkg as Record<string, unknown>).name === "@rynfar/meridian" &&
+					typeof (pkg as Record<string, unknown>).version === "string"
+				) {
+					return (pkg as Record<string, unknown>).version as string;
+				}
+			} catch {
+				// Try next candidate path
+			}
+		}
+	} catch {
+		// Fallback: can't determine
+	}
+	return null;
 }
 
 async function getLatestVersion(): Promise<string | null> {
-  try {
-    const { stdout } = await exec("npm view @rynfar/meridian version", {
-      timeout: 10000,
-    });
-    return stdout.trim();
-  } catch {
-    return null;
-  }
+	try {
+		const { stdout } = await exec("npm view @rynfar/meridian version", {
+			timeout: 10000,
+		});
+		return stdout.trim();
+	} catch {
+		return null;
+	}
 }
 
 async function checkVersion(): Promise<VersionStatus> {
-  const [installed, latest] = await Promise.all([
-    getInstalledVersion(),
-    getLatestVersion(),
-  ]);
+	const [installed, latest] = await Promise.all([
+		getInstalledVersion(),
+		getLatestVersion(),
+	]);
 
-  return {
-    installed,
-    latest,
-    updateAvailable:
-      installed !== null && latest !== null && compareSemver(installed, latest) < 0,
-  };
+	return {
+		installed,
+		latest,
+		updateAvailable:
+			installed !== null &&
+			latest !== null &&
+			compareSemver(installed, latest) < 0,
+	};
 }
 
 // ---------------------------------------------------------------------------
 // Extension
 // ---------------------------------------------------------------------------
 
-export default function (pi: ExtensionAPI) {
-  const baseUrl = getBaseUrl();
-  const port = getPortFromBaseUrl(baseUrl);
-  const apiKey = getApiKey();
-  const providerHeaders = getProviderHeaders();
-  const requestHeaders = {
-    ...providerHeaders,
-    Authorization: `Bearer ${apiKey}`,
-  };
+// ---------------------------------------------------------------------------
+// Model autodiscovery
+// ---------------------------------------------------------------------------
 
-  // Register the Meridian provider
-  pi.registerProvider("meridian", {
-    baseUrl,
-    apiKey, // Placeholder unless MERIDIAN_API_KEY is enabled on the daemon
-    api: "anthropic-messages",
-    authHeader: true,
-    headers: providerHeaders,
-    models: [
-      {
-        id: "claude-fable-5",
-        name: "Claude Fable 5 (Meridian)",
-        reasoning: true,
-        input: DEFAULT_MODEL_INPUT,
-        cost: FABLE_COST,
-        contextWindow: DEFAULT_CONTEXT_WINDOW,
-        maxTokens: FABLE_MAX_TOKENS,
-      },
-      {
-        id: "claude-sonnet-5",
-        name: "Claude Sonnet 5 (Meridian)",
-        reasoning: true,
-        input: DEFAULT_MODEL_INPUT,
-        cost: SONNET_5_COST,
-        contextWindow: DEFAULT_CONTEXT_WINDOW,
-        maxTokens: SONNET_MAX_TOKENS,
-      },
-      {
-        id: "claude-sonnet-4-6",
-        name: "Claude Sonnet 4.6 (Meridian)",
-        reasoning: true,
-        input: DEFAULT_MODEL_INPUT,
-        cost: SONNET_COST,
-        contextWindow: DEFAULT_CONTEXT_WINDOW,
-        maxTokens: SONNET_MAX_TOKENS,
-      },
-      {
-        id: "claude-opus-4-6",
-        name: "Claude Opus 4.6 (Meridian)",
-        reasoning: true,
-        input: DEFAULT_MODEL_INPUT,
-        cost: OPUS_COST,
-        contextWindow: EXTENDED_CONTEXT_WINDOW,
-        maxTokens: OPUS_MAX_TOKENS,
-      },
-      {
-        id: "claude-opus-4-7",
-        name: "Claude Opus 4.7 (Meridian)",
-        reasoning: true,
-        input: DEFAULT_MODEL_INPUT,
-        cost: OPUS_COST,
-        contextWindow: EXTENDED_CONTEXT_WINDOW,
-        maxTokens: OPUS_MAX_TOKENS,
-      },
-      {
-        id: "claude-opus-4-8",
-        name: "Claude Opus 4.8 (Meridian)",
-        reasoning: true,
-        input: DEFAULT_MODEL_INPUT,
-        cost: OPUS_COST,
-        contextWindow: EXTENDED_CONTEXT_WINDOW,
-        maxTokens: OPUS_MAX_TOKENS,
-      },
-      {
-        id: "claude-haiku-4-5",
-        name: "Claude Haiku 4.5 (Meridian)",
-        reasoning: true,
-        input: DEFAULT_MODEL_INPUT,
-        cost: HAIKU_COST,
-        contextWindow: DEFAULT_CONTEXT_WINDOW,
-        maxTokens: HAIKU_MAX_TOKENS,
-      },
-    ],
-  });
+/**
+ * Extract the model family from a Meridian model id, e.g. "claude-fable-5" ->
+ * "fable", "claude-opus-4-7" -> "opus". Resolves per-family fallbacks for
+ * fields /v1/models does not expose (max output tokens, pricing).
+ */
+function modelFamily(id: string): string {
+	const parts = id.split("-");
+	return (parts[1] ?? "").toLowerCase();
+}
 
-  pi.on("before_provider_request", (event, ctx) => {
-    if (ctx.model?.provider !== "meridian") return;
+/**
+ * Map a Meridian /v1/models entry to a pi model config. Capabilities drive
+ * reasoning and input modalities; context_window drives contextWindow; name
+ * comes from display_name. maxTokens and cost come from the per-family fallback
+ * tables (with exact-id cost overrides) since /v1/models exposes neither.
+ */
+function mapMeridianModel(entry: MeridianModelEntry): MeridianModelConfig {
+	const id = entry.id;
+	const family = modelFamily(id);
+	const caps = entry.capabilities ?? {};
+	const reasoning = caps.thinking?.supported === true;
+	const imageSupported =
+		caps.image_input?.supported === true || caps.pdf_input?.supported === true;
+	const input: ("text" | "image")[] = imageSupported
+		? ["text", "image"]
+		: ["text"];
+	const displayName = (entry.display_name ?? "").trim();
+	const name = displayName ? `${displayName} (Meridian)` : `${id} (Meridian)`;
+	return {
+		id,
+		name,
+		reasoning,
+		input,
+		cost: ID_COST_OVERRIDES[id] ?? FAMILY_COST[family] ?? DEFAULT_COST,
+		contextWindow: entry.context_window ?? DEFAULT_CONTEXT_WINDOW,
+		maxTokens: FAMILY_MAX_TOKENS[family] ?? DEFAULT_MAX_TOKENS,
+	};
+}
 
-    if (!event.payload || typeof event.payload !== "object") {
-      return event.payload;
-    }
+/** Fetch the model list from a reachable Meridian proxy. */
+async function fetchMeridianModels(
+	baseUrl: string,
+	headers: Record<string, string>,
+	signal?: AbortSignal,
+): Promise<MeridianModelEntry[]> {
+	const response = await fetch(`${baseUrl}/v1/models`, { headers, signal });
+	if (!response.ok) {
+		throw new Error(`Meridian /v1/models returned HTTP ${response.status}`);
+	}
+	const body = (await response.json()) as { data?: MeridianModelEntry[] };
+	return Array.isArray(body?.data) ? body.data : [];
+}
 
-    return {
-      ...(event.payload as Record<string, unknown>),
-      system: buildMeridianSafeSystemPrompt(ctx.getSystemPrompt(), ctx.cwd),
-    };
-  });
+// Static catalog used when discovery fails. Mirrors what a current Meridian
+// proxy (>= 1.52.0) serves so the failure mode matches today's behavior.
+const STATIC_FALLBACK_MODELS: MeridianModelConfig[] = [
+	{
+		id: "claude-fable-5",
+		name: "Claude Fable 5 (Meridian)",
+		reasoning: true,
+		input: DEFAULT_MODEL_INPUT,
+		cost: FABLE_COST,
+		contextWindow: DEFAULT_CONTEXT_WINDOW,
+		maxTokens: FABLE_MAX_TOKENS,
+	},
+	{
+		id: "claude-sonnet-5",
+		name: "Claude Sonnet 5 (Meridian)",
+		reasoning: true,
+		input: DEFAULT_MODEL_INPUT,
+		cost: SONNET_5_COST,
+		contextWindow: DEFAULT_CONTEXT_WINDOW,
+		maxTokens: SONNET_MAX_TOKENS,
+	},
+	{
+		id: "claude-sonnet-4-6",
+		name: "Claude Sonnet 4.6 (Meridian)",
+		reasoning: true,
+		input: DEFAULT_MODEL_INPUT,
+		cost: SONNET_COST,
+		contextWindow: DEFAULT_CONTEXT_WINDOW,
+		maxTokens: SONNET_MAX_TOKENS,
+	},
+	{
+		id: "claude-opus-4-6",
+		name: "Claude Opus 4.6 (Meridian)",
+		reasoning: true,
+		input: DEFAULT_MODEL_INPUT,
+		cost: OPUS_COST,
+		contextWindow: EXTENDED_CONTEXT_WINDOW,
+		maxTokens: OPUS_MAX_TOKENS,
+	},
+	{
+		id: "claude-opus-4-7",
+		name: "Claude Opus 4.7 (Meridian)",
+		reasoning: true,
+		input: DEFAULT_MODEL_INPUT,
+		cost: OPUS_COST,
+		contextWindow: EXTENDED_CONTEXT_WINDOW,
+		maxTokens: OPUS_MAX_TOKENS,
+	},
+	{
+		id: "claude-opus-4-8",
+		name: "Claude Opus 4.8 (Meridian)",
+		reasoning: true,
+		input: DEFAULT_MODEL_INPUT,
+		cost: OPUS_COST,
+		contextWindow: EXTENDED_CONTEXT_WINDOW,
+		maxTokens: OPUS_MAX_TOKENS,
+	},
+	{
+		id: "claude-haiku-4-5",
+		name: "Claude Haiku 4.5 (Meridian)",
+		reasoning: true,
+		input: DEFAULT_MODEL_INPUT,
+		cost: HAIKU_COST,
+		contextWindow: DEFAULT_CONTEXT_WINDOW,
+		maxTokens: HAIKU_MAX_TOKENS,
+	},
+];
 
-  // Proactive error detection via HTTP status — fires before stream consumption.
-  // This catches auth failures, server errors, and rate limits before the
-  // user sees a cryptic streaming error.
-  pi.on("after_provider_response", (event, ctx) => {
-    if (ctx.model?.provider !== "meridian") return;
+/**
+ * Discover models from the running Meridian proxy. If the proxy is unreachable
+ * or returns an unexpected payload, fall back to the static catalog so pi
+ * always has models available. The factory does NOT spawn the daemon here —
+ * spawning is deferred to the session_start handler, because the factory may
+ * run in non-session invocations such as `pi --list-models`.
+ */
+async function resolveMeridianModels(
+	baseUrl: string,
+	requestHeaders: Record<string, string>,
+): Promise<MeridianModelConfig[]> {
+	const controller = new AbortController();
+	const timeout = setTimeout(
+		() => controller.abort(),
+		MODEL_DISCOVERY_TIMEOUT_MS,
+	);
+	try {
+		const entries = await fetchMeridianModels(
+			baseUrl,
+			requestHeaders,
+			controller.signal,
+		);
+		const mapped = entries.map(mapMeridianModel);
+		return mapped.length > 0 ? mapped : STATIC_FALLBACK_MODELS;
+	} catch {
+		return STATIC_FALLBACK_MODELS;
+	} finally {
+		clearTimeout(timeout);
+	}
+}
 
-    if (event.status === 401 || event.status === 403) {
-      ctx.ui.notify(
-        `Meridian auth error (HTTP ${event.status}). Run /meridian to check login status and verify MERIDIAN_API_KEY if API-key auth is enabled.`,
-        "error"
-      );
-    } else if (event.status >= 500) {
-      ctx.ui.notify(
-        `Meridian server error (HTTP ${event.status}). The proxy may be misconfigured or down.`,
-        "error"
-      );
-    } else if (event.status >= 400) {
-      ctx.ui.notify(
-        `Meridian request error (HTTP ${event.status}).`,
-        "warning"
-      );
-    }
-  });
+export default async function (pi: ExtensionAPI) {
+	const baseUrl = getBaseUrl();
+	const port = getPortFromBaseUrl(baseUrl);
+	const apiKey = getApiKey();
+	const providerHeaders = getProviderHeaders();
+	const requestHeaders = {
+		...providerHeaders,
+		Authorization: `Bearer ${apiKey}`,
+	};
 
-  // Register /meridian command with optional "start" argument
-  pi.registerCommand("meridian", {
-    description: "Check Meridian status. Use: /meridian start | /meridian version",
-    handler: async (args, ctx) => {
-      const subcmd = args.trim().toLowerCase();
+	// Register the Meridian provider
+	pi.registerProvider("meridian", {
+		baseUrl,
+		apiKey, // Placeholder unless MERIDIAN_API_KEY is enabled on the daemon
+		api: "anthropic-messages",
+		authHeader: true,
+		headers: providerHeaders,
+		models: await resolveMeridianModels(baseUrl, requestHeaders),
+	});
 
-      // /meridian start — start the daemon if not running
-      if (subcmd === "start") {
-        const { ok: alreadyRunning, health: runningHealth } = await isReachable(
-          baseUrl,
-          HEALTH_TIMEOUT_MS,
-          requestHeaders
-        );
-        if (alreadyRunning && runningHealth) {
-          ctx.ui.notify(`Meridian is already running at ${baseUrl}`, "info");
-          return;
-        }
-        ctx.ui.notify(`Starting Meridian on port ${port}...`, "info");
-        const started = await startMeridianDaemon(baseUrl, port, requestHeaders);
-        if (started) {
-          const health = await fetchHealth(baseUrl, undefined, requestHeaders);
-          if (health.auth?.loggedIn) {
-            ctx.ui.notify(
-              `✓ Meridian started (${baseUrl}) — ${health.auth.email} (${health.auth.subscriptionType || "unknown"})`,
-              "info"
-            );
-          } else {
-            ctx.ui.notify(
-              `✓ Meridian started (${baseUrl}) — not logged in, run: claude login`,
-              "warning"
-            );
-          }
-        } else {
-          // spawn error details were captured in startMeridianDaemon
-          ctx.ui.notify(
-            `Failed to start Meridian. Is it installed? (npm install -g @rynfar/meridian)`,
-            "error"
-          );
-        }
-        return;
-      }
+	pi.on("before_provider_request", (event, ctx) => {
+		if (ctx.model?.provider !== "meridian") return;
 
-      // /meridian version — check for updates
-      if (subcmd === "version" || subcmd === "update") {
-        ctx.ui.notify("Checking Meridian version...", "info");
-        const [health, version] = await Promise.all([
-          fetchHealth(baseUrl, undefined, requestHeaders).catch(
-            (): MeridianHealth => ({ status: "unreachable" })
-          ),
-          checkVersion(),
-        ]);
+		if (!event.payload || typeof event.payload !== "object") {
+			return event.payload;
+		}
 
-        const lines: string[] = [];
-        if (health.version) {
-          lines.push(`Runtime:   v${health.version}`);
-        }
-        if (version.installed) {
-          lines.push(`Installed: v${version.installed}`);
-        } else {
-          lines.push("Installed: unknown (meridian not found on PATH)");
-        }
-        if (version.latest) {
-          lines.push(`Latest:    v${version.latest}`);
-        } else {
-          lines.push("Latest:    could not check (npm unreachable?)");
-        }
+		return {
+			...(event.payload as Record<string, unknown>),
+			system: buildMeridianSafeSystemPrompt(ctx.getSystemPrompt(), ctx.cwd),
+		};
+	});
 
-        if (version.updateAvailable) {
-          lines.push("");
-          lines.push(`⚠ Update available: v${version.installed} → v${version.latest}`);
-          lines.push("  Run: npm install -g @rynfar/meridian");
-        } else if (version.installed && version.latest) {
-          lines.push("");
-          lines.push("✓ Up to date");
-        }
+	// Proactive error detection via HTTP status — fires before stream consumption.
+	// This catches auth failures, server errors, and rate limits before the
+	// user sees a cryptic streaming error.
+	pi.on("after_provider_response", (event, ctx) => {
+		if (ctx.model?.provider !== "meridian") return;
 
-        const running = health.status !== "unreachable";
-        lines.push("");
-        lines.push(running ? `Running at ${baseUrl}` : `Not running`);
+		if (event.status === 401 || event.status === 403) {
+			ctx.ui.notify(
+				`Meridian auth error (HTTP ${event.status}). Run /meridian to check login status and verify MERIDIAN_API_KEY if API-key auth is enabled.`,
+				"error",
+			);
+		} else if (event.status >= 500) {
+			ctx.ui.notify(
+				`Meridian server error (HTTP ${event.status}). The proxy may be misconfigured or down.`,
+				"error",
+			);
+		} else if (event.status >= 400) {
+			ctx.ui.notify(
+				`Meridian request error (HTTP ${event.status}).`,
+				"warning",
+			);
+		}
+	});
 
-        ctx.ui.notify(lines.join("\n"), version.updateAvailable ? "warning" : "info");
-        return;
-      }
+	// Register /meridian command with optional "start" argument
+	pi.registerCommand("meridian", {
+		description:
+			"Check Meridian status. Use: /meridian start | /meridian version",
+		handler: async (args, ctx) => {
+			const subcmd = args.trim().toLowerCase();
 
-      // Unknown subcommand
-      if (subcmd && subcmd !== "") {
-        ctx.ui.notify(
-          `Unknown /meridian subcommand: ${subcmd}. Use: /meridian start | /meridian version`,
-          "error"
-        );
-        return;
-      }
+			// /meridian start — start the daemon if not running
+			if (subcmd === "start") {
+				const { ok: alreadyRunning, health: runningHealth } = await isReachable(
+					baseUrl,
+					HEALTH_TIMEOUT_MS,
+					requestHeaders,
+				);
+				if (alreadyRunning && runningHealth) {
+					ctx.ui.notify(`Meridian is already running at ${baseUrl}`, "info");
+					return;
+				}
+				ctx.ui.notify(`Starting Meridian on port ${port}...`, "info");
+				const started = await startMeridianDaemon(
+					baseUrl,
+					port,
+					requestHeaders,
+				);
+				if (started) {
+					const health = await fetchHealth(baseUrl, undefined, requestHeaders);
+					if (health.auth?.loggedIn) {
+						ctx.ui.notify(
+							`✓ Meridian started (${baseUrl}) — ${health.auth.email} (${health.auth.subscriptionType || "unknown"})`,
+							"info",
+						);
+					} else {
+						ctx.ui.notify(
+							`✓ Meridian started (${baseUrl}) — not logged in, run: claude login`,
+							"warning",
+						);
+					}
+				} else {
+					// spawn error details were captured in startMeridianDaemon
+					ctx.ui.notify(
+						`Failed to start Meridian. Is it installed? (npm install -g @rynfar/meridian)`,
+						"error",
+					);
+				}
+				return;
+			}
 
-      // /meridian — health check
-      let health: MeridianHealth;
-      try {
-        health = await fetchHealth(baseUrl, ctx.signal, requestHeaders);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        if (msg.includes("timed out")) {
-          ctx.ui.notify(
-            `Meridian health check timed out at ${baseUrl}`,
-            "error"
-          );
-        } else if (err instanceof Error && err.name === "AbortError") {
-          return; // User cancelled
-        } else {
-          ctx.ui.notify(
-            `Meridian unreachable at ${baseUrl}. Use /meridian start to launch it.`,
-            "error"
-          );
-        }
-        return;
-      }
+			// /meridian version — check for updates
+			if (subcmd === "version" || subcmd === "update") {
+				ctx.ui.notify("Checking Meridian version...", "info");
+				const [health, version] = await Promise.all([
+					fetchHealth(baseUrl, undefined, requestHeaders).catch(
+						(): MeridianHealth => ({ status: "unreachable" }),
+					),
+					checkVersion(),
+				]);
 
-      if (health.status === "healthy") {
-        const lines = [
-          `✓ Meridian connected (${baseUrl})`,
-          ...(health.version ? [`  Version: ${health.version}`] : []),
-          ...(health.auth?.loggedIn
-            ? [`  Auth: ${health.auth.email} (${health.auth.subscriptionType || "unknown"})`]
-            : [`  Auth: ${health.error || "not logged in"}. Run: claude login`]),
-          `  Mode: ${health.mode || "unknown"}`,
-        ];
-        ctx.ui.notify(
-          lines.join("\n"),
-          health.auth?.loggedIn ? "info" : "warning"
-        );
-      } else if (health.status === "degraded") {
-        ctx.ui.notify(
-          `Meridian degraded: ${health.error || "unknown"}`,
-          "warning"
-        );
-      } else {
-        ctx.ui.notify(
-          `Meridian unhealthy: ${health.error || health.status}`,
-          "error"
-        );
-      }
-    },
-  });
+				const lines: string[] = [];
+				if (health.version) {
+					lines.push(`Runtime:   v${health.version}`);
+				}
+				if (version.installed) {
+					lines.push(`Installed: v${version.installed}`);
+				} else {
+					lines.push("Installed: unknown (meridian not found on PATH)");
+				}
+				if (version.latest) {
+					lines.push(`Latest:    v${version.latest}`);
+				} else {
+					lines.push("Latest:    could not check (npm unreachable?)");
+				}
 
-  // Auto-start Meridian on session start if provider is active and proxy is down
-  pi.on("session_start", async (_event, ctx) => {
-    const model = ctx.model;
-    if (model?.provider !== "meridian") return;
+				if (version.updateAvailable) {
+					lines.push("");
+					lines.push(
+						`⚠ Update available: v${version.installed} → v${version.latest}`,
+					);
+					lines.push("  Run: npm install -g @rynfar/meridian");
+				} else if (version.installed && version.latest) {
+					lines.push("");
+					lines.push("✓ Up to date");
+				}
 
-    try {
-      const health = await fetchHealth(baseUrl, undefined, requestHeaders);
-      if (health.status !== "healthy" || !health.auth?.loggedIn) {
-        ctx.ui.notify(
-          `Meridian issue: ${health.error || health.status}. Run /meridian for details.`,
-          "warning"
-        );
-      }
-    } catch {
-      // Meridian is unreachable — try auto-starting
-      ctx.ui.notify(`Meridian not running. Auto-starting...`, "info");
-      const started = await startMeridianDaemon(baseUrl, port, requestHeaders);
-      if (started) {
-        ctx.ui.notify(
-          `✓ Meridian auto-started at ${baseUrl}`,
-          "info"
-        );
-      } else {
-        ctx.ui.notify(
-          `Could not auto-start Meridian. Run manually: meridian`,
-          "error"
-        );
-      }
-    }
+				const running = health.status !== "unreachable";
+				lines.push("");
+				lines.push(running ? `Running at ${baseUrl}` : `Not running`);
 
-    // Check for updates once per pi launch
-    if (!versionChecked) {
-      versionChecked = true;
-      const version = await checkVersion();
-      if (version.updateAvailable) {
-        ctx.ui.notify(
-          `⚠ Meridian update available: v${version.installed} → v${version.latest}. Run /meridian version for details.`,
-          "warning"
-        );
-      }
-    }
-  });
+				ctx.ui.notify(
+					lines.join("\n"),
+					version.updateAvailable ? "warning" : "info",
+				);
+				return;
+			}
+
+			// Unknown subcommand
+			if (subcmd && subcmd !== "") {
+				ctx.ui.notify(
+					`Unknown /meridian subcommand: ${subcmd}. Use: /meridian start | /meridian version`,
+					"error",
+				);
+				return;
+			}
+
+			// /meridian — health check
+			let health: MeridianHealth;
+			try {
+				health = await fetchHealth(baseUrl, ctx.signal, requestHeaders);
+			} catch (err) {
+				const msg = err instanceof Error ? err.message : String(err);
+				if (msg.includes("timed out")) {
+					ctx.ui.notify(
+						`Meridian health check timed out at ${baseUrl}`,
+						"error",
+					);
+				} else if (err instanceof Error && err.name === "AbortError") {
+					return; // User cancelled
+				} else {
+					ctx.ui.notify(
+						`Meridian unreachable at ${baseUrl}. Use /meridian start to launch it.`,
+						"error",
+					);
+				}
+				return;
+			}
+
+			if (health.status === "healthy") {
+				const lines = [
+					`✓ Meridian connected (${baseUrl})`,
+					...(health.version ? [`  Version: ${health.version}`] : []),
+					...(health.auth?.loggedIn
+						? [
+								`  Auth: ${health.auth.email} (${health.auth.subscriptionType || "unknown"})`,
+							]
+						: [
+								`  Auth: ${health.error || "not logged in"}. Run: claude login`,
+							]),
+					`  Mode: ${health.mode || "unknown"}`,
+				];
+				ctx.ui.notify(
+					lines.join("\n"),
+					health.auth?.loggedIn ? "info" : "warning",
+				);
+			} else if (health.status === "degraded") {
+				ctx.ui.notify(
+					`Meridian degraded: ${health.error || "unknown"}`,
+					"warning",
+				);
+			} else {
+				ctx.ui.notify(
+					`Meridian unhealthy: ${health.error || health.status}`,
+					"error",
+				);
+			}
+		},
+	});
+
+	// Auto-start Meridian on session start if provider is active and proxy is down
+	pi.on("session_start", async (_event, ctx) => {
+		const model = ctx.model;
+		if (model?.provider !== "meridian") return;
+
+		try {
+			const health = await fetchHealth(baseUrl, undefined, requestHeaders);
+			if (health.status !== "healthy" || !health.auth?.loggedIn) {
+				ctx.ui.notify(
+					`Meridian issue: ${health.error || health.status}. Run /meridian for details.`,
+					"warning",
+				);
+			}
+		} catch {
+			// Meridian is unreachable — try auto-starting
+			ctx.ui.notify(`Meridian not running. Auto-starting...`, "info");
+			const started = await startMeridianDaemon(baseUrl, port, requestHeaders);
+			if (started) {
+				ctx.ui.notify(`✓ Meridian auto-started at ${baseUrl}`, "info");
+			} else {
+				ctx.ui.notify(
+					`Could not auto-start Meridian. Run manually: meridian`,
+					"error",
+				);
+			}
+		}
+
+		// Check for updates once per pi launch
+		if (!versionChecked) {
+			versionChecked = true;
+			const version = await checkVersion();
+			if (version.updateAvailable) {
+				ctx.ui.notify(
+					`⚠ Meridian update available: v${version.installed} → v${version.latest}. Run /meridian version for details.`,
+					"warning",
+				);
+			}
+		}
+	});
 }

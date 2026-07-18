@@ -4,16 +4,19 @@ Use your **Claude Max subscription** through [pi](https://github.com/mariozechne
 
 Without this extension, pi's default system prompt triggers an `"You're out of extra usage"` error on Claude Opus 4.6 (and potentially other models) when routed through Meridian. This extension rewrites the system prompt **only for Meridian requests** to avoid that issue, while leaving all other providers untouched.
 
-> **Fork notice.** This is [`viktors/pi-meridian-extension`](https://github.com/viktors/pi-meridian-extension), a fork of [`lnilluv/pi-meridian-extension`](https://github.com/lnilluv/pi-meridian-extension). It adds the **Claude Fable 5** and **Claude Sonnet 5** models and bundles `@rynfar/meridian` as a dependency so the proxy auto-starts from a plain `npm install` (no global install needed). Consume it as a pi git package: `pi install git:github.com/viktors/pi-meridian-extension@<commit>`.
+> **Fork notice.** This is [`viktors/pi-meridian-extension`](https://github.com/viktors/pi-meridian-extension), a fork of [`lnilluv/pi-meridian-extension`](https://github.com/lnilluv/pi-meridian-extension). It **auto-discovers the model catalog from the running Meridian proxy** at session start (so new models like Claude Fable 5 / Sonnet 5 appear without code changes), bundles `@rynfar/meridian` as a dependency so the proxy auto-starts from a plain `npm install`, and keeps a static fallback catalog for when the proxy is briefly down. Consume it as a pi git package: `pi install git:github.com/viktors/pi-meridian-extension@<commit>`.
 
 ## What it does
 
-- **Registers a `meridian` provider** with the current Meridian Claude models (Fable 5, Sonnet 5, Sonnet 4.6, Opus 4.6, Opus 4.7, Opus 4.8, Haiku 4.5)
+- **Auto-discovers models** from the Meridian proxy's `/v1/models` endpoint at session start — new models appear without editing the extension. Falls back to a static catalog if the proxy is unreachable.
+- **Registers a `meridian` provider** with the discovered models (Fable 5, Sonnet 5, Sonnet 4.6, Opus 4.6/4.7/4.8, Haiku 4.5 as of Meridian v1.52.0)
 - **Rewrites the system prompt** for Meridian requests to avoid the extra-usage error, preserving project context and working directory
 - **Auto-starts Meridian** on session start if the proxy isn't running
 - **Adds commands**: `/meridian` (health check), `/meridian start`, `/meridian version`
 
 ## Models
+
+The catalog is **discovered at runtime** from the Meridian proxy (GET `/v1/models`). Each entry's `context_window`, `display_name`, and capabilities (thinking, image input) are mapped directly; the table below shows what a current proxy (v1.52.0) serves.
 
 | ID | Name |
 | ---- | ------ |
@@ -26,6 +29,10 @@ Without this extension, pi's default system prompt triggers an `"You're out of e
 | `meridian/claude-haiku-4-5` | Claude Haiku 4.5 |
 
 Use them with `--model`, e.g. `--model meridian/claude-fable-5:high`.
+
+> **maxTokens and pricing are not exposed by `/v1/models`.** The extension fills them from a per-family fallback table (e.g. Fable → 128K output / $10–$50 per M tokens, Sonnet → 64K, Opus → 32K, Haiku → 16K; Sonnet 5 uses its promotional rate). Unknown models get a conservative 32K output and zero cost. Pricing only affects pi's spend display — your Claude subscription via the proxy is unaffected.
+>
+> Discovery runs once per pi launch (no mid-session refresh). To pick up newly added models, restart pi. For models to appear in Ctrl+P cycling automatically, use a wildcard in `enabledModels`, e.g. `"meridian/claude-*"`.
 
 ## Install
 
