@@ -76,6 +76,8 @@ test('provider model catalog matches current upstream Meridian models', async ()
   const provider = pi.providers.get('meridian');
 
   assert.deepEqual(provider.models.map((model) => model.id), [
+    'claude-fable-5',
+    'claude-sonnet-5',
     'claude-sonnet-4-6',
     'claude-opus-4-6',
     'claude-opus-4-7',

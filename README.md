@@ -4,9 +4,11 @@ Use your **Claude Max subscription** through [pi](https://github.com/mariozechne
 
 Without this extension, pi's default system prompt triggers an `"You're out of extra usage"` error on Claude Opus 4.6 (and potentially other models) when routed through Meridian. This extension rewrites the system prompt **only for Meridian requests** to avoid that issue, while leaving all other providers untouched.
 
+> **Fork notice.** This is [`viktors/pi-meridian-extension`](https://github.com/viktors/pi-meridian-extension), a fork of [`lnilluv/pi-meridian-extension`](https://github.com/lnilluv/pi-meridian-extension). It adds the **Claude Fable 5** and **Claude Sonnet 5** models and bundles `@rynfar/meridian` as a dependency so the proxy auto-starts from a plain `npm install` (no global install needed). Consume it as a pi git package: `pi install git:github.com/viktors/pi-meridian-extension@<commit>`.
+
 ## What it does
 
-- **Registers a `meridian` provider** with the current Meridian Claude models (Sonnet 4.6, Opus 4.6, Opus 4.7, Opus 4.8, Haiku 4.5)
+- **Registers a `meridian` provider** with the current Meridian Claude models (Fable 5, Sonnet 5, Sonnet 4.6, Opus 4.6, Opus 4.7, Opus 4.8, Haiku 4.5)
 - **Rewrites the system prompt** for Meridian requests to avoid the extra-usage error, preserving project context and working directory
 - **Auto-starts Meridian** on session start if the proxy isn't running
 - **Adds commands**: `/meridian` (health check), `/meridian start`, `/meridian version`
@@ -14,31 +16,36 @@ Without this extension, pi's default system prompt triggers an `"You're out of e
 ## Models
 
 | ID | Name |
-|----|------|
+| ---- | ------ |
+| `meridian/claude-fable-5` | Claude Fable 5 |
+| `meridian/claude-sonnet-5` | Claude Sonnet 5 |
 | `meridian/claude-sonnet-4-6` | Claude Sonnet 4.6 |
 | `meridian/claude-opus-4-6` | Claude Opus 4.6 |
 | `meridian/claude-opus-4-7` | Claude Opus 4.7 |
 | `meridian/claude-opus-4-8` | Claude Opus 4.8 |
 | `meridian/claude-haiku-4-5` | Claude Haiku 4.5 |
 
-Use them with `--model`, e.g. `--model meridian/claude-opus-4-8:high`.
+Use them with `--model`, e.g. `--model meridian/claude-fable-5:high`.
 
 ## Install
 
+From this fork (recommended for `viktors`):
+
 ```bash
-pi install npm:pi-meridian-extension
+pi install git:github.com/viktors/pi-meridian-extension
 ```
 
-Requires [Meridian](https://github.com/rynfar/meridian) installed globally:
+`@rynfar/meridian` is declared as a dependency, so pi's clone-time `npm install` provides the `meridian` binary at `node_modules/.bin/meridian` and the extension auto-starts the proxy with no extra setup. (Upstream's npm flow and a global install also still work:)
 
 ```bash
-npm install -g @rynfar/meridian
+pi install npm:pi-meridian-extension   # upstream
+npm install -g @rynfar/meridian         # only needed without the bundled dep
 ```
 
 ## Configuration
 
 | Env var | Default | Description |
-|---------|---------|-------------|
+| --------- | --------- | ------------- |
 | `MERIDIAN_BASE_URL` | `http://127.0.0.1:3456` | Meridian proxy URL |
 | `MERIDIAN_API_KEY` | `meridian` | Bearer token sent to Meridian. Set this to the same value as the Meridian daemon when upstream API-key auth is enabled. |
 | `MERIDIAN_PROFILE` | unset | Optional Meridian profile ID sent as `x-meridian-profile` for multi-profile setups. |

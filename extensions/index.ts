@@ -3,6 +3,7 @@ import { spawn, exec as execCallback } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { realpathSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 const exec = promisify(execCallback);
@@ -18,9 +19,17 @@ const EXTENDED_CONTEXT_WINDOW = 1000000;
 const SONNET_MAX_TOKENS = 64000;
 const OPUS_MAX_TOKENS = 32768;
 const HAIKU_MAX_TOKENS = 16384;
+const FABLE_MAX_TOKENS = 128000;
+const SONNET_5_COST = { input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 } as const;
+const FABLE_COST = { input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5 } as const;
 const SONNET_COST = { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 } as const;
 const OPUS_COST = { input: 15, output: 75, cacheRead: 1.5, cacheWrite: 18.75 } as const;
 const HAIKU_COST = { input: 0.8, output: 4, cacheRead: 0.08, cacheWrite: 1 } as const;
+const LOCAL_MERIDIAN_BIN = fileURLToPath(new URL("../../.bin/meridian", import.meta.url));
+
+function getMeridianBin(): string {
+  return process.env.MERIDIAN_BIN?.trim() || LOCAL_MERIDIAN_BIN || "meridian";
+}
 
 function getBaseUrl(): string {
   return process.env.MERIDIAN_BASE_URL || DEFAULT_BASE_URL;
@@ -238,7 +247,7 @@ async function startMeridianDaemon(
     try {
       await new Promise<void>((resolveSpawn) => {
         try {
-          const child = spawn("meridian", ["--port", String(port)], {
+          const child = spawn(getMeridianBin(), ["--port", String(port)], {
             detached: true,
             stdio: "ignore",
             env: process.env,
@@ -314,9 +323,12 @@ function compareSemver(a: string, b: string): number {
 
 async function getInstalledVersion(): Promise<string | null> {
   try {
-    // Try the global node_modules via the meridian executable
-    const { stdout: whichOutput } = await exec("which meridian", { timeout: 3000 });
-    const binPath = whichOutput.trim();
+    // Try the configured or bundled meridian executable first.
+    let binPath = getMeridianBin();
+    if (!binPath) {
+      const { stdout: whichOutput } = await exec("which meridian", { timeout: 3000 });
+      binPath = whichOutput.trim();
+    }
     if (!binPath) return null;
 
     // Resolve the real path (in case it's a symlink)
@@ -401,6 +413,24 @@ export default function (pi: ExtensionAPI) {
     authHeader: true,
     headers: providerHeaders,
     models: [
+      {
+        id: "claude-fable-5",
+        name: "Claude Fable 5 (Meridian)",
+        reasoning: true,
+        input: DEFAULT_MODEL_INPUT,
+        cost: FABLE_COST,
+        contextWindow: DEFAULT_CONTEXT_WINDOW,
+        maxTokens: FABLE_MAX_TOKENS,
+      },
+      {
+        id: "claude-sonnet-5",
+        name: "Claude Sonnet 5 (Meridian)",
+        reasoning: true,
+        input: DEFAULT_MODEL_INPUT,
+        cost: SONNET_5_COST,
+        contextWindow: DEFAULT_CONTEXT_WINDOW,
+        maxTokens: SONNET_MAX_TOKENS,
+      },
       {
         id: "claude-sonnet-4-6",
         name: "Claude Sonnet 4.6 (Meridian)",
