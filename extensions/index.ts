@@ -59,6 +59,13 @@ const OPUS_COST: CostTable = {
 	cacheRead: 1.5,
 	cacheWrite: 18.75,
 };
+// Opus 5 (and Meridian's current opus-family rate for 4.5+) is $5/$25.
+const OPUS_5_COST: CostTable = {
+	input: 5,
+	output: 25,
+	cacheRead: 0.5,
+	cacheWrite: 6.25,
+};
 const HAIKU_COST: CostTable = {
 	input: 0.8,
 	output: 4,
@@ -91,6 +98,11 @@ const FAMILY_COST: Record<string, CostTable> = {
 };
 const ID_COST_OVERRIDES: Record<string, CostTable> = {
 	"claude-sonnet-5": SONNET_5_COST, // promotional rate through 2026-08-31
+	"claude-opus-5": OPUS_5_COST,
+};
+// Exact-id maxTokens overrides (Opus 5 matches Fable's 128K output ceiling).
+const ID_MAX_TOKENS_OVERRIDES: Record<string, number> = {
+	"claude-opus-5": FABLE_MAX_TOKENS,
 };
 // Shape of a Meridian /v1/models entry (only the fields we consume).
 interface MeridianModelCapability {
@@ -562,7 +574,10 @@ function mapMeridianModel(entry: MeridianModelEntry): MeridianModelConfig {
 		input,
 		cost: ID_COST_OVERRIDES[id] ?? FAMILY_COST[family] ?? DEFAULT_COST,
 		contextWindow: entry.context_window ?? DEFAULT_CONTEXT_WINDOW,
-		maxTokens: FAMILY_MAX_TOKENS[family] ?? DEFAULT_MAX_TOKENS,
+		maxTokens:
+			ID_MAX_TOKENS_OVERRIDES[id] ??
+			FAMILY_MAX_TOKENS[family] ??
+			DEFAULT_MAX_TOKENS,
 	};
 }
 
@@ -609,6 +624,15 @@ const STATIC_FALLBACK_MODELS: MeridianModelConfig[] = [
 		cost: SONNET_COST,
 		contextWindow: DEFAULT_CONTEXT_WINDOW,
 		maxTokens: SONNET_MAX_TOKENS,
+	},
+	{
+		id: "claude-opus-5",
+		name: "Claude Opus 5 (Meridian)",
+		reasoning: true,
+		input: DEFAULT_MODEL_INPUT,
+		cost: OPUS_5_COST,
+		contextWindow: EXTENDED_CONTEXT_WINDOW,
+		maxTokens: FABLE_MAX_TOKENS,
 	},
 	{
 		id: "claude-opus-4-6",
@@ -671,7 +695,14 @@ async function resolveMeridianModels(
 			controller.signal,
 		);
 		const mapped = entries.map(mapMeridianModel);
-		return mapped.length > 0 ? mapped : STATIC_FALLBACK_MODELS;
+		if (mapped.length === 0) return STATIC_FALLBACK_MODELS;
+		// Proxy may lag the static floor (e.g. Opus 5 before Meridian lists it).
+		// Keep discovered entries authoritative; append any missing fallbacks.
+		const seen = new Set(mapped.map((m) => m.id));
+		for (const fallback of STATIC_FALLBACK_MODELS) {
+			if (!seen.has(fallback.id)) mapped.push(fallback);
+		}
+		return mapped;
 	} catch {
 		return STATIC_FALLBACK_MODELS;
 	} finally {

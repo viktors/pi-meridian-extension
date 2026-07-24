@@ -9,28 +9,29 @@ Without this extension, pi's default system prompt triggers an `"You're out of e
 ## What it does
 
 - **Auto-discovers models** from the Meridian proxy's `/v1/models` endpoint at session start — new models appear without editing the extension. Falls back to a static catalog if the proxy is unreachable.
-- **Registers a `meridian` provider** with the discovered models (Fable 5, Sonnet 5, Sonnet 4.6, Opus 4.6/4.7/4.8, Haiku 4.5 as of Meridian v1.52.0)
+- **Registers a `meridian` provider** with the discovered models plus a static floor (Fable 5, Sonnet 5, Sonnet 4.6, Opus 5/4.6/4.7/4.8, Haiku 4.5). Floor fills gaps when the proxy lags (e.g. Opus 5 before Meridian lists it).
 - **Rewrites the system prompt** for Meridian requests to avoid the extra-usage error, preserving project context and working directory
 - **Auto-starts Meridian** on session start if the proxy isn't running
 - **Adds commands**: `/meridian` (health check), `/meridian start`, `/meridian version`
 
 ## Models
 
-The catalog is **discovered at runtime** from the Meridian proxy (GET `/v1/models`). Each entry's `context_window`, `display_name`, and capabilities (thinking, image input) are mapped directly; the table below shows what a current proxy (v1.52.0) serves.
+The catalog is **discovered at runtime** from the Meridian proxy (GET `/v1/models`), then **unioned with a static floor** so models Meridian routes but has not yet advertised still appear. Each entry's `context_window`, `display_name`, and capabilities (thinking, image input) are mapped directly; the table below is the static floor.
 
 | ID | Name |
 | ---- | ------ |
 | `meridian/claude-fable-5` | Claude Fable 5 |
 | `meridian/claude-sonnet-5` | Claude Sonnet 5 |
 | `meridian/claude-sonnet-4-6` | Claude Sonnet 4.6 |
+| `meridian/claude-opus-5` | Claude Opus 5 |
 | `meridian/claude-opus-4-6` | Claude Opus 4.6 |
 | `meridian/claude-opus-4-7` | Claude Opus 4.7 |
 | `meridian/claude-opus-4-8` | Claude Opus 4.8 |
 | `meridian/claude-haiku-4-5` | Claude Haiku 4.5 |
 
-Use them with `--model`, e.g. `--model meridian/claude-fable-5:high`.
+Use them with `--model`, e.g. `--model meridian/claude-opus-5:high`.
 
-> **maxTokens and pricing are not exposed by `/v1/models`.** The extension fills them from a per-family fallback table (e.g. Fable → 128K output / $10–$50 per M tokens, Sonnet → 64K, Opus → 32K, Haiku → 16K; Sonnet 5 uses its promotional rate). Unknown models get a conservative 32K output and zero cost. Pricing only affects pi's spend display — your Claude subscription via the proxy is unaffected.
+> **maxTokens and pricing are not exposed by `/v1/models`.** The extension fills them from a per-family fallback table (e.g. Fable → 128K output / $10–$50 per M tokens, Sonnet → 64K, Opus 4.x → 32K / $15–$75, Opus 5 → 128K / $5–$25, Haiku → 16K; Sonnet 5 uses its promotional rate). Unknown models get a conservative 32K output and zero cost. Pricing only affects pi's spend display — your Claude subscription via the proxy is unaffected.
 >
 > Discovery runs once per pi launch (no mid-session refresh). To pick up newly added models, restart pi. For models to appear in Ctrl+P cycling automatically, use a wildcard in `enabledModels`, e.g. `"meridian/claude-*"`.
 
@@ -77,13 +78,13 @@ extensions: /path/to/other/extension.ts, /opt/homebrew/lib/node_modules/pi-merid
 After installing, switch your model in pi:
 
 ```
-/model meridian/claude-opus-4-8:high
+/model meridian/claude-opus-5:high
 ```
 
 Or use it for a single command:
 
 ```bash
-pi --model meridian/claude-opus-4-8:high
+pi --model meridian/claude-opus-5:high
 ```
 
 ## Commands

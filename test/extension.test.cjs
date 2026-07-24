@@ -118,11 +118,12 @@ test("provider discovers models from /v1/models and maps capabilities", async (t
 
 	const pi = await registerWithEnv();
 	const provider = pi.providers.get("meridian");
+	const ids = provider.models.map((m) => m.id);
 
-	assert.deepEqual(
-		provider.models.map((m) => m.id),
-		["claude-fable-5", "claude-opus-4-8"],
-	);
+	// Discovered entries come first; static-floor gaps append after.
+	assert.equal(ids[0], "claude-fable-5");
+	assert.equal(ids[1], "claude-opus-4-8");
+	assert.ok(ids.includes("claude-opus-5"));
 
 	const fable = provider.models.find((m) => m.id === "claude-fable-5");
 	assert.equal(fable.name, "Claude Fable 5 (Meridian)");
@@ -144,6 +145,53 @@ test("provider discovers models from /v1/models and maps capabilities", async (t
 		output: 75,
 		cacheRead: 1.5,
 		cacheWrite: 18.75,
+	});
+});
+
+test("provider maps discovered claude-opus-5 with id overrides", async (t) => {
+	const originalFetch = global.fetch;
+	t.after(() => {
+		global.fetch = originalFetch;
+	});
+
+	global.fetch = async (url) => {
+		const u = String(url);
+		if (u.endsWith("/v1/models")) {
+			return {
+				ok: true,
+				status: 200,
+				json: async () => ({
+					object: "list",
+					data: [
+						{
+							id: "claude-opus-5",
+							display_name: "Claude Opus 5",
+							context_window: 1000000,
+							capabilities: {
+								thinking: { supported: true },
+								image_input: { supported: true },
+							},
+						},
+					],
+				}),
+			};
+		}
+		throw new Error(`unexpected fetch ${u}`);
+	};
+
+	const pi = await registerWithEnv();
+	const opus5 = pi.providers
+		.get("meridian")
+		.models.find((m) => m.id === "claude-opus-5");
+	assert.equal(opus5.name, "Claude Opus 5 (Meridian)");
+	assert.equal(opus5.reasoning, true);
+	assert.equal(opus5.contextWindow, 1000000);
+	assert.equal(opus5.maxTokens, 128000);
+	assert.deepEqual(opus5.cost, {
+		input: 5,
+		output: 25,
+		cacheRead: 0.5,
+		cacheWrite: 6.25,
 	});
 });
 
@@ -170,10 +218,71 @@ test("provider falls back to static catalog when Meridian is unreachable", async
 			"claude-opus-4-6",
 			"claude-opus-4-7",
 			"claude-opus-4-8",
+			"claude-opus-5",
 			"claude-sonnet-4-6",
 			"claude-sonnet-5",
 		],
 	);
+
+	const opus5 = provider.models.find((m) => m.id === "claude-opus-5");
+	assert.equal(opus5.maxTokens, 128000);
+	assert.deepEqual(opus5.cost, {
+		input: 5,
+		output: 25,
+		cacheRead: 0.5,
+		cacheWrite: 6.25,
+	});
+});
+
+test("provider keeps static floor models missing from /v1/models", async (t) => {
+	const originalFetch = global.fetch;
+	t.after(() => {
+		global.fetch = originalFetch;
+	});
+
+	// Live Meridian (as of 1.56.x) still omits claude-opus-5 from /v1/models
+	// even though explicitModelPin routes it. Discovery must union the static floor.
+	global.fetch = async (url) => {
+		const u = String(url);
+		if (u.endsWith("/v1/models")) {
+			return {
+				ok: true,
+				status: 200,
+				json: async () => ({
+					object: "list",
+					data: [
+						{
+							id: "claude-opus-4-8",
+							display_name: "Claude Opus 4.8",
+							context_window: 200000,
+							capabilities: {
+								thinking: { supported: true },
+								image_input: { supported: true },
+							},
+						},
+					],
+				}),
+			};
+		}
+		throw new Error(`unexpected fetch ${u}`);
+	};
+
+	const pi = await registerWithEnv();
+	const ids = pi.providers.get("meridian").models.map((m) => m.id);
+	assert.ok(ids.includes("claude-opus-4-8"));
+	assert.ok(ids.includes("claude-opus-5"));
+
+	const opus5 = pi.providers
+		.get("meridian")
+		.models.find((m) => m.id === "claude-opus-5");
+	assert.equal(opus5.name, "Claude Opus 5 (Meridian)");
+	assert.equal(opus5.maxTokens, 128000);
+	assert.deepEqual(opus5.cost, {
+		input: 5,
+		output: 25,
+		cacheRead: 0.5,
+		cacheWrite: 6.25,
+	});
 });
 
 test("/meridian health sends configured auth and profile headers", async (t) => {
